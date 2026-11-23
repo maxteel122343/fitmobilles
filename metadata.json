@@ -1,0 +1,8 @@
+{
+  "name": "Remix InstantHMR",
+  "description": "Imported from GitHub: maxteel122343/InstantHMR",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

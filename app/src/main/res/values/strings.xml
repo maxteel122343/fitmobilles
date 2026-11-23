@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">FitVerso</string>
+    <string name="nav_home">Início</string>
+    <string name="nav_studio">Treinar</string>
+    <string name="nav_exercises">Explorar</string>
+    <string name="nav_coach">Coach</string>
+    <string name="nav_plans">Planos</string>
+    <string name="nav_models">InstantHMR</string>
+    <string name="source_photo">Foto</string>
+    <string name="source_video">Vídeo</string>
+    <string name="source_camera">Câmera</string>
+    <string name="pick_photo">Abrir Foto</string>
+    <string name="pick_video">Abrir Vídeo</string>
+    <string name="sample_runner">Corredor</string>
+    <string name="sample_dancer">Dupla</string>
+    <string name="camera_permission_rationale">Permissão de câmera necessária para contagem automática de reps e avatar 3D em tempo real.</string>
+    <string name="grant_camera_permission">Ativar Câmera</string>
+    <string name="view_mode_split">Split</string>
+    <string name="view_mode_2d">2D</string>
+    <string name="view_mode_3d">3D</string>
+    <string name="export_obj">Exportar Mesh 3D (.obj)</string>
+    <string name="export_json">Exportar Frame (.json)</string>
+    <string name="export_snapshots_json">Exportar Snapshots (.json)</string>
+    <string name="export_snapshots_csv">Exportar Snapshots (.csv)</string>
+    <string name="download_weights">Baixar ONNX</string>
+    <string name="import_onnx">Importar .onnx</string>
+</resources>
