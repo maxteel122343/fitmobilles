@@ -1,6 +1,7 @@
 package com.example.ml
 
 import android.graphics.Bitmap
+import android.util.Log
 import com.example.domain.model.FrameResult
 import com.example.domain.model.HmrPrediction
 import com.example.domain.model.PipelineConfig
@@ -33,11 +34,21 @@ class PosePipeline(
     private var frameIndex = 0
     private var trackedBoxes: List<FloatArray> = emptyList()
     private var trackedScores: FloatArray = FloatArray(0)
+    private var lastFullBodyVisible: Boolean = true
+
+    @Volatile
+    var lastActiveProviderLabel: String? = null
+        private set
+
+    @Volatile
+    var lastFallbackReason: String? = null
+        private set
 
     fun resetTracking() {
         frameIndex = 0
         trackedBoxes = emptyList()
         trackedScores = FloatArray(0)
+        lastFullBodyVisible = true
         poseFilter?.reset()
         temporalSmoother?.reset()
     }
@@ -53,8 +64,11 @@ class PosePipeline(
         val engine = onnxEngine
 
         val t0 = System.nanoTime()
+        val hasValidTracked = trackedBoxes.isNotEmpty() && trackedBoxes.all { b ->
+            (b[2] - b[0]) >= 24f && (b[3] - b[1]) >= 24f
+        }
         val runDetector = (frameIndex % config.detectorStride.coerceAtLeast(1) == 0) ||
-            trackedBoxes.isEmpty() ||
+            !hasValidTracked ||
             engine == null
 
         var fallbackPose: com.google.mlkit.vision.pose.Pose? = null
@@ -68,6 +82,7 @@ class PosePipeline(
             trackedBoxes = det.boxes
             trackedScores = det.scores
             fallbackPose = det.primaryPose
+            lastFullBodyVisible = det.isFullBodyVisible
         }
         val t1 = System.nanoTime()
 
@@ -79,7 +94,7 @@ class PosePipeline(
         var engineLabel = "ML Kit Preview"
 
         var persons: List<HmrPrediction> = if (engine != null) {
-            faces = engine.faces
+            faces = if (config.showMesh) engine.faces else IntArray(0)
             engineLabel = "${config.modelVariant.id} (${engine.activeProviderLabel})"
             engine.predict(
                 bitmap = bitmap,
@@ -87,13 +102,18 @@ class PosePipeline(
                 confidences = trackedScores,
                 focalOverride = config.customFocalPx,
                 poseFilter = if (isStream) poseFilter else null,
-                timestampSec = timestampSec
+                timestampSec = timestampSec,
+                includeVertices = config.showMesh
             )
         } else {
             val mapped = fallbackPose?.let { Mhr70Skeleton.fromMlKitPose(it, w, h, focal) }
             if (mapped != null) {
-                val proxy = ProceduralBodyMeshBuilder.build(mapped.joints3dLocal)
-                faces = proxy.faces
+                val proxy = if (config.showMesh) {
+                    ProceduralBodyMeshBuilder.build(mapped.joints3dLocal)
+                } else {
+                    null
+                }
+                faces = proxy?.faces ?: IntArray(0)
                 listOf(
                     HmrPrediction(
                         bbox = trackedBoxes.firstOrNull() ?: mapped.bbox,
@@ -106,7 +126,7 @@ class PosePipeline(
                         focalLength = focal,
                         imageWidth = w,
                         imageHeight = h,
-                        verticesLocal = proxy.verticesLocal,
+                        verticesLocal = proxy?.verticesLocal ?: FloatArray(0),
                         isOnnxFullMesh = false
                     )
                 )
@@ -122,8 +142,24 @@ class PosePipeline(
         }
         val t2 = System.nanoTime()
 
-        if (isStream && persons.isNotEmpty()) {
-            trackedBoxes = persons.map { Mhr70Skeleton.keypointBox(it.joints2d, w, h) }
+        if (isStream) {
+            if (persons.isNotEmpty()) {
+                trackedBoxes = persons.map { Mhr70Skeleton.keypointBox(it.joints2d, w, h) }
+                // Also evaluate full-body framing from 2D ankle/shoulder keypoints
+                val j2 = persons.first().joints2d
+                val noseY = j2[1]
+                val lAnkY = j2[13 * 2 + 1]
+                val rAnkY = j2[14 * 2 + 1]
+                val lHipY = j2[9 * 2 + 1]
+                val ankSpread = kotlin.math.max(lAnkY - lHipY, rAnkY - lHipY)
+                if (runDetector) {
+                    // keep detector's accurate visibility check, or check bounds
+                    lastFullBodyVisible = lastFullBodyVisible && noseY >= 0f && ankSpread > 12f
+                }
+            } else {
+                // Force immediate re-detection on next frame if tracking lost
+                trackedBoxes = emptyList()
+            }
         }
 
         val currentIdx = frameIndex++
@@ -137,7 +173,8 @@ class PosePipeline(
             hmrMs = hmrMs,
             engineLabel = engineLabel,
             frameIndex = currentIdx,
-            timestampSec = timestampSec
+            timestampSec = timestampSec,
+            isFullBodyVisible = lastFullBodyVisible
         )
     }
 
@@ -163,12 +200,24 @@ class PosePipeline(
 
         if (sig != loadedSignature) {
             onnxEngine?.close()
-            onnxEngine = if (activeFiles != null) {
-                runCatching {
+            if (activeFiles != null) {
+                val created = runCatching {
                     OnnxInstantHmrEngine(activeFiles.first, activeFiles.second, config.executionDevice)
-                }.getOrNull()
+                }
+                onnxEngine = created.getOrNull()
+                val err = created.exceptionOrNull()
+                if (err != null) {
+                    Log.w("PosePipeline", "Failed to initialize OnnxInstantHmrEngine", err)
+                    lastActiveProviderLabel = "ML Kit Preview (erro ONNX)"
+                    lastFallbackReason = err.message ?: err::class.java.simpleName
+                } else {
+                    lastActiveProviderLabel = onnxEngine?.activeProviderLabel
+                    lastFallbackReason = onnxEngine?.providerFallbackReason
+                }
             } else {
-                null
+                onnxEngine = null
+                lastActiveProviderLabel = "ML Kit Preview (sem pesos ONNX)"
+                lastFallbackReason = null
             }
             loadedSignature = sig
         }

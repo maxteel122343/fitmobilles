@@ -121,6 +121,8 @@ fun ProfileSettingsScreen(
     onImportCustomOnnx: (Uri) -> Unit,
     onDeleteCachedFile: (File) -> Unit,
     onUpdateConfig: ((PipelineConfig) -> PipelineConfig) -> Unit,
+    activeProviderLabel: String? = null,
+    providerFallbackReason: String? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -180,6 +182,8 @@ fun ProfileSettingsScreen(
                 onImportCustomOnnx = onImportCustomOnnx,
                 onDeleteCachedFile = onDeleteCachedFile,
                 onUpdateConfig = onUpdateConfig,
+                activeProviderLabel = activeProviderLabel,
+                providerFallbackReason = providerFallbackReason,
                 modifier = Modifier.weight(1f)
             )
         }

@@ -195,12 +195,12 @@ enum class ViewportMode(val label: String) {
 }
 
 data class PipelineConfig(
-    val modelVariant: ModelVariant = ModelVariant.MEDIUM,
-    val fitLevel: Int = 2,
+    val modelVariant: ModelVariant = ModelVariant.NANO,
+    val fitLevel: Int = 0,
     val executionDevice: ExecutionDevice = ExecutionDevice.XNNPACK,
-    val maxPersons: Int = 4,
+    val maxPersons: Int = 1,
     val detConfidence: Float = 0.5f,
-    val detectorStride: Int = 1,
+    val detectorStride: Int = 5,
     val customFocalPx: Float? = null,
     val poseFilter: PoseFilterKind = PoseFilterKind.ONE_EURO,
     val smoothOutput: Boolean = false,
@@ -226,15 +226,17 @@ data class HmrPrediction(
     val verticesLocal: FloatArray,
     val isOnnxFullMesh: Boolean
 ) {
-    val joints3dCam: FloatArray
-        get() = FloatArray(joints3dLocal.size) { i ->
+    val joints3dCam: FloatArray by lazy(LazyThreadSafetyMode.NONE) {
+        FloatArray(joints3dLocal.size) { i ->
             joints3dLocal[i] + camTrans[i % 3]
         }
+    }
 
-    val verticesCam: FloatArray
-        get() = FloatArray(verticesLocal.size) { i ->
+    val verticesCam: FloatArray by lazy(LazyThreadSafetyMode.NONE) {
+        FloatArray(verticesLocal.size) { i ->
             verticesLocal[i] + camTrans[i % 3]
         }
+    }
 
     fun copyWith(
         joints2d: FloatArray = this.joints2d,
@@ -256,7 +258,8 @@ data class FrameResult(
     val hmrMs: Float,
     val engineLabel: String,
     val frameIndex: Int,
-    val timestampSec: Float
+    val timestampSec: Float,
+    val isFullBodyVisible: Boolean = true
 ) {
     val totalMs: Float get() = detectorMs + hmrMs
     val fps: Float get() = if (totalMs > 0f) 1000f / totalMs else 0f

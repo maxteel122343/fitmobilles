@@ -45,6 +45,8 @@ fun SystemHubScreen(
     onImportCustomOnnx: (android.net.Uri) -> Unit,
     onDeleteCachedFile: (File) -> Unit,
     onUpdateConfig: ((PipelineConfig) -> PipelineConfig) -> Unit,
+    activeProviderLabel: String? = null,
+    providerFallbackReason: String? = null,
     modifier: Modifier = Modifier
 ) {
     FitVersoDarkArenaTheme {
@@ -102,6 +104,8 @@ fun SystemHubScreen(
                 PipelineSettingsScreen(
                     config = config,
                     onUpdateConfig = onUpdateConfig,
+                    activeProviderLabel = activeProviderLabel,
+                    providerFallbackReason = providerFallbackReason,
                     modifier = Modifier.weight(1f)
                 )
             }

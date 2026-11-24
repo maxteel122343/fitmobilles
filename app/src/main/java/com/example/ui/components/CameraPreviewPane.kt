@@ -6,6 +6,7 @@ import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -64,11 +65,18 @@ fun CameraPreviewPane(
                 }
             }
 
-            val preview = Preview.Builder().build().apply {
-                surfaceProvider = previewView.surfaceProvider
-            }
+            val previewResSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .build()
+
+            val preview = Preview.Builder()
+                .setResolutionSelector(previewResSelector)
+                .build().apply {
+                    surfaceProvider = previewView.surfaceProvider
+                }
 
             val resSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
                     ResolutionStrategy(
                         Size(480, 360),

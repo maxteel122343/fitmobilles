@@ -9,6 +9,7 @@ import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.util.Base64
+import android.util.Log
 import com.example.domain.model.ExecutionDevice
 import com.example.domain.model.HmrPrediction
 import com.example.domain.skeleton.Mhr70Skeleton
@@ -25,8 +26,8 @@ import kotlin.math.max
 
 /**
  * Kotlin + ONNX Runtime port of instanthmr/inference.py (InstantHMR).
- * Supports both standalone network graphs (fit=0) and network + kinematic-fit graphs (fit=1|2),
- * plus the shared mhr-body.onnx graph producing 70 3D keypoints and 18,439 vertices.
+ * Optimized for real-time mobile execution with multi-threaded XNNPACK, reusable scratch buffers,
+ * optional mesh vertex skip (--no-mesh), and explicit NNAPI/XNNPACK fallback detection.
  */
 class OnnxInstantHmrEngine(
     networkPath: File,
@@ -35,6 +36,7 @@ class OnnxInstantHmrEngine(
 ) : AutoCloseable {
 
     companion object {
+        private const val TAG = "OnnxInstantHmrEngine"
         private val IMAGENET_MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val IMAGENET_STD = floatArrayOf(0.229f, 0.224f, 0.225f)
         private const val CROP_EXPAND = 1.2f
@@ -50,19 +52,41 @@ class OnnxInstantHmrEngine(
     val nCrops: Int
     val scales: FloatArray
     val faces: IntArray
+    val requestedDevice: ExecutionDevice = device
+    val actualNetworkDevice: ExecutionDevice
+    val providerFallbackReason: String?
+    val isProviderFallback: Boolean
+        get() = actualNetworkDevice != requestedDevice
     val activeProviderLabel: String
 
+    private val numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+
+    // Reusable scratch buffers for zero-GC single-frame hot path
+    private var scratchCropBitmap: Bitmap? = null
+    private var scratchCropCanvas: Canvas? = null
+    private val scratchCropPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val scratchMatrix = Matrix()
+    private var scratchArgb: IntArray = IntArray(0)
+    private var scratchChannelFloats: FloatArray = FloatArray(0)
+    private var scratchImgFloatBuf: FloatBuffer? = null
+    private var scratchCliffFloatBuf: FloatBuffer? = null
+    private val scratchMhr1Buf: FloatBuffer =
+        ByteBuffer.allocateDirect(204 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val scratchShape1Buf: FloatBuffer =
+        ByteBuffer.allocateDirect(45 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+
+    private data class SessionInitResult(
+        val session: OrtSession,
+        val actualDevice: ExecutionDevice,
+        val fallbackReason: String?
+    )
+
     init {
-        val opts = OrtSession.SessionOptions().apply {
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            setIntraOpNumThreads(4)
-            when (device) {
-                ExecutionDevice.NNAPI -> runCatching { addNnapi() }
-                ExecutionDevice.XNNPACK -> runCatching { addXnnpack(emptyMap()) }
-                ExecutionDevice.CPU -> Unit
-            }
-        }
-        networkSession = env.createSession(networkPath.absolutePath, opts)
+        val netInit = createNetworkSessionWithFallback(networkPath, device)
+        networkSession = netInit.session
+        actualNetworkDevice = netInit.actualDevice
+        providerFallbackReason = netInit.fallbackReason
+
         val meta = networkSession.metadata.customMetadata
         inputSize = meta["image_size"]?.toIntOrNull() ?: 288
         cliffFocal = (meta["cliff_focal"] ?: "true") == "true"
@@ -73,11 +97,11 @@ class OnnxInstantHmrEngine(
             floatArrayOf(1.0f)
         }
 
-        val bodyOpts = OrtSession.SessionOptions().apply {
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            setIntraOpNumThreads(4)
-        }
-        bodySession = env.createSession(bodyPath.absolutePath, bodyOpts)
+        // Enable multi-threaded XNNPACK on mhr-body.onnx as well (falls back to CPU if unavailable)
+        val bodyInit = createBodySession(bodyPath, device)
+        bodySession = bodyInit.session
+        val bodyDeviceLabel = bodyInit.actualDevice.label
+
         val facesB64 = bodySession.metadata.customMetadata["mesh_faces"]
             ?: error("mhr-body.onnx missing 'mesh_faces' metadata")
         val rawBytes = Base64.decode(facesB64, Base64.DEFAULT)
@@ -85,7 +109,80 @@ class OnnxInstantHmrEngine(
         faces = IntArray(intBuf.remaining())
         intBuf.get(faces)
 
-        activeProviderLabel = "${device.label} · ${if (nCrops > 0) "Fit $nCrops" else "Net"}"
+        val graphTag = if (nCrops > 0) "Fit $nCrops" else "Net"
+        activeProviderLabel = when {
+            actualNetworkDevice != requestedDevice ->
+                "Fallback ${actualNetworkDevice.label} (sem ${requestedDevice.label}) · $graphTag"
+            actualNetworkDevice == ExecutionDevice.NNAPI ->
+                "NNAPI (rede; malha $bodyDeviceLabel) · $graphTag"
+            else ->
+                "${actualNetworkDevice.label} · $graphTag"
+        }
+    }
+
+    private fun createNetworkSessionWithFallback(
+        networkPath: File,
+        requested: ExecutionDevice
+    ): SessionInitResult {
+        val candidates = when (requested) {
+            ExecutionDevice.NNAPI -> listOf(ExecutionDevice.NNAPI, ExecutionDevice.XNNPACK, ExecutionDevice.CPU)
+            ExecutionDevice.XNNPACK -> listOf(ExecutionDevice.XNNPACK, ExecutionDevice.CPU)
+            ExecutionDevice.CPU -> listOf(ExecutionDevice.CPU)
+        }
+
+        var firstFailure: String? = null
+        for (candidate in candidates) {
+            val opts = OrtSession.SessionOptions()
+            try {
+                opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                opts.setIntraOpNumThreads(numThreads)
+                when (candidate) {
+                    ExecutionDevice.NNAPI -> opts.addNnapi()
+                    ExecutionDevice.XNNPACK -> opts.addXnnpack(mapOf("intra_op_num_threads" to numThreads.toString()))
+                    ExecutionDevice.CPU -> Unit
+                }
+                val session = env.createSession(networkPath.absolutePath, opts)
+                return SessionInitResult(
+                    session = session,
+                    actualDevice = candidate,
+                    fallbackReason = if (candidate != requested) firstFailure else null
+                )
+            } catch (t: Throwable) {
+                runCatching { opts.close() }
+                val reason = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
+                if (candidate == requested) {
+                    firstFailure = "${candidate.label} falhou: $reason"
+                }
+                Log.w(TAG, "Execution provider ${candidate.label} unavailable: $reason", t)
+                if (candidate == ExecutionDevice.CPU) throw t
+            }
+        }
+        error("Failed to initialize ONNX network session")
+    }
+
+    private fun createBodySession(bodyPath: File, requested: ExecutionDevice): SessionInitResult {
+        val preferXnnpack = requested != ExecutionDevice.CPU
+        val candidates = if (preferXnnpack) {
+            listOf(ExecutionDevice.XNNPACK, ExecutionDevice.CPU)
+        } else {
+            listOf(ExecutionDevice.CPU)
+        }
+        for (candidate in candidates) {
+            val opts = OrtSession.SessionOptions()
+            try {
+                opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                opts.setIntraOpNumThreads(numThreads)
+                if (candidate == ExecutionDevice.XNNPACK) {
+                    opts.addXnnpack(mapOf("intra_op_num_threads" to numThreads.toString()))
+                }
+                val session = env.createSession(bodyPath.absolutePath, opts)
+                return SessionInitResult(session = session, actualDevice = candidate, fallbackReason = null)
+            } catch (t: Throwable) {
+                runCatching { opts.close() }
+                if (candidate == ExecutionDevice.CPU) throw t
+            }
+        }
+        error("Failed to initialize ONNX body session")
     }
 
     fun focalPx(h: Int, w: Int, focalOverride: Float?): Float {
@@ -100,7 +197,8 @@ class OnnxInstantHmrEngine(
         confidences: FloatArray,
         focalOverride: Float?,
         poseFilter: PoseFilter?,
-        timestampSec: Float?
+        timestampSec: Float?,
+        includeVertices: Boolean = true
     ): List<HmrPrediction> {
         if (boxes.isEmpty()) return emptyList()
         val w = bitmap.width
@@ -114,7 +212,7 @@ class OnnxInstantHmrEngine(
         }
 
         val filteredMhrParams = poseFilter?.filter(boxes, netOut.mhrParams, timestampSec) ?: netOut.mhrParams
-        val bodyOut = runBodyGraph(filteredMhrParams, netOut.shapeParams)
+        val bodyOut = runBodyGraph(filteredMhrParams, netOut.shapeParams, includeVertices = includeVertices)
 
         return boxes.indices.map { i ->
             HmrPrediction(
@@ -129,7 +227,7 @@ class OnnxInstantHmrEngine(
                 imageWidth = w,
                 imageHeight = h,
                 verticesLocal = bodyOut.vertices[i],
-                isOnnxFullMesh = true
+                isOnnxFullMesh = includeVertices
             )
         }
     }
@@ -152,27 +250,75 @@ class OnnxInstantHmrEngine(
         val squareBox: FloatArray
     )
 
+    private fun ensureScratchCropBitmap(s: Int): Bitmap {
+        val existing = scratchCropBitmap
+        if (existing != null && !existing.isRecycled && existing.width == s && existing.height == s) {
+            return existing
+        }
+        existing?.recycle()
+        val created = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        scratchCropBitmap = created
+        scratchCropCanvas = Canvas(created)
+        return created
+    }
+
     private fun estimateNetwork(bitmap: Bitmap, boxes: List<FloatArray>, focal: Float): NetworkBatchResult {
         val batch = boxes.size
         val crops = boxes.map { extractCrop(bitmap, it, 1.0f, focal) }
         val s = inputSize
-        val imgBuf = ByteBuffer.allocateDirect(batch * 3 * s * s * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer()
-        val cliffBuf = ByteBuffer.allocateDirect(batch * 3 * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer()
-
-        // NCHW ImageNet-normalised
         val hw = s * s
-        val channelBuf = FloatArray(3 * hw)
+
+        val neededImgFloats = batch * 3 * hw
+        val imgBuf = if (batch == 1) {
+            val cached = scratchImgFloatBuf
+            if (cached != null && cached.capacity() == neededImgFloats) {
+                cached.clear()
+                cached
+            } else {
+                ByteBuffer.allocateDirect(neededImgFloats * 4)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer()
+                    .also { scratchImgFloatBuf = it }
+            }
+        } else {
+            ByteBuffer.allocateDirect(neededImgFloats * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        }
+
+        val neededCliffFloats = batch * 3
+        val cliffBuf = if (batch == 1) {
+            val cached = scratchCliffFloatBuf
+            if (cached != null && cached.capacity() == neededCliffFloats) {
+                cached.clear()
+                cached
+            } else {
+                ByteBuffer.allocateDirect(neededCliffFloats * 4)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer()
+                    .also { scratchCliffFloatBuf = it }
+            }
+        } else {
+            ByteBuffer.allocateDirect(neededCliffFloats * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        }
+
+        val channelBuf = if (scratchChannelFloats.size == 3 * hw) {
+            scratchChannelFloats
+        } else {
+            FloatArray(3 * hw).also { scratchChannelFloats = it }
+        }
+        val inv255 = 1f / 255f
+        val mean0 = IMAGENET_MEAN[0]; val mean1 = IMAGENET_MEAN[1]; val mean2 = IMAGENET_MEAN[2]
+        val invStd0 = 1f / IMAGENET_STD[0]; val invStd1 = 1f / IMAGENET_STD[1]; val invStd2 = 1f / IMAGENET_STD[2]
+        val hw2 = 2 * hw
+
         for (b in 0 until batch) {
             val rgb = crops[b].pixelsRgb
+            var rgbIdx = 0
             for (p in 0 until hw) {
-                val r = (rgb[p * 3].toInt() and 0xFF) / 255f
-                val g = (rgb[p * 3 + 1].toInt() and 0xFF) / 255f
-                val bl = (rgb[p * 3 + 2].toInt() and 0xFF) / 255f
-                channelBuf[p] = (r - IMAGENET_MEAN[0]) / IMAGENET_STD[0]
-                channelBuf[hw + p] = (g - IMAGENET_MEAN[1]) / IMAGENET_STD[1]
-                channelBuf[2 * hw + p] = (bl - IMAGENET_MEAN[2]) / IMAGENET_STD[2]
+                val r = (rgb[rgbIdx].toInt() and 0xFF) * inv255
+                val g = (rgb[rgbIdx + 1].toInt() and 0xFF) * inv255
+                val bl = (rgb[rgbIdx + 2].toInt() and 0xFF) * inv255
+                rgbIdx += 3
+                channelBuf[p] = (r - mean0) * invStd0
+                channelBuf[hw + p] = (g - mean1) * invStd1
+                channelBuf[hw2 + p] = (bl - mean2) * invStd2
             }
             imgBuf.put(channelBuf)
             cliffBuf.put(crops[b].cliffCond)
@@ -275,10 +421,22 @@ class OnnxInstantHmrEngine(
         return NetworkBatchResult(mhrOut, shapeOut, camOut, j2dOut)
     }
 
-    private fun runBodyGraph(mhrParams: Array<FloatArray>, shapeParams: Array<FloatArray>): BodyBatchResult {
+    private fun runBodyGraph(
+        mhrParams: Array<FloatArray>,
+        shapeParams: Array<FloatArray>,
+        includeVertices: Boolean
+    ): BodyBatchResult {
         val batch = mhrParams.size
-        val mhrBuf = ByteBuffer.allocateDirect(batch * 204 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-        val shapeBuf = ByteBuffer.allocateDirect(batch * 45 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val mhrBuf = if (batch == 1) {
+            scratchMhr1Buf.apply { clear() }
+        } else {
+            ByteBuffer.allocateDirect(batch * 204 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        }
+        val shapeBuf = if (batch == 1) {
+            scratchShape1Buf.apply { clear() }
+        } else {
+            ByteBuffer.allocateDirect(batch * 45 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        }
         for (i in 0 until batch) {
             mhrBuf.put(mhrParams[i])
             shapeBuf.put(shapeParams[i])
@@ -293,11 +451,16 @@ class OnnxInstantHmrEngine(
             shapeTensor.use { tShape ->
                 bodySession.run(mapOf("mhr_params" to tMhr, "shape_params" to tShape)).use { res ->
                     val j3dTensor = res["joints_3d"].get() as OnnxTensor
-                    val vertTensor = res["vertices"].get() as OnnxTensor
-                    val vCount = vertTensor.info.shape[1].toInt()
+                    val verts = if (includeVertices) {
+                        val vertTensor = res["vertices"].get() as OnnxTensor
+                        val vCount = vertTensor.info.shape[1].toInt()
+                        extractBatchFloats(vertTensor, batch, vCount * 3)
+                    } else {
+                        Array(batch) { FloatArray(0) }
+                    }
                     BodyBatchResult(
                         joints3d = extractBatchFloats(j3dTensor, batch, 70 * 3),
-                        vertices = extractBatchFloats(vertTensor, batch, vCount * 3)
+                        vertices = verts
                     )
                 }
             }
@@ -338,25 +501,26 @@ class OnnxInstantHmrEngine(
         val cropH = max(1.0, iy2 - iy1)
 
         val s = inputSize
-        val cropBitmap = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(cropBitmap)
-        val matrix = Matrix().apply {
-            postTranslate(-ix1.toFloat(), -iy1.toFloat())
-            postScale((s / cropW).toFloat(), (s / cropH).toFloat())
-        }
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
-        canvas.drawBitmap(bitmap, matrix, paint)
+        val cropBitmap = ensureScratchCropBitmap(s)
+        cropBitmap.eraseColor(0)
+        val canvas = scratchCropCanvas!!
+        scratchMatrix.reset()
+        scratchMatrix.postTranslate(-ix1.toFloat(), -iy1.toFloat())
+        scratchMatrix.postScale((s / cropW).toFloat(), (s / cropH).toFloat())
+        canvas.drawBitmap(bitmap, scratchMatrix, scratchCropPaint)
 
-        val argb = IntArray(s * s)
+        val hw = s * s
+        val argb = if (scratchArgb.size == hw) scratchArgb else IntArray(hw).also { scratchArgb = it }
         cropBitmap.getPixels(argb, 0, s, 0, 0, s, s)
-        cropBitmap.recycle()
 
-        val rgb = ByteArray(s * s * 3)
-        for (i in argb.indices) {
+        val rgb = ByteArray(hw * 3)
+        var dst = 0
+        for (i in 0 until hw) {
             val px = argb[i]
-            rgb[i * 3] = ((px shr 16) and 0xFF).toByte()
-            rgb[i * 3 + 1] = ((px shr 8) and 0xFF).toByte()
-            rgb[i * 3 + 2] = (px and 0xFF).toByte()
+            rgb[dst] = ((px shr 16) and 0xFF).toByte()
+            rgb[dst + 1] = ((px shr 8) and 0xFF).toByte()
+            rgb[dst + 2] = (px and 0xFF).toByte()
+            dst += 3
         }
 
         return CropData(
@@ -377,6 +541,9 @@ class OnnxInstantHmrEngine(
     }
 
     override fun close() {
+        scratchCropBitmap?.recycle()
+        scratchCropBitmap = null
+        scratchCropCanvas = null
         runCatching { networkSession.close() }
         runCatching { bodySession.close() }
     }

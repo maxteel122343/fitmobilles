@@ -30,8 +30,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -52,11 +53,65 @@ import kotlin.math.max
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+private class MeshRenderScratch {
+    var px = FloatArray(0)
+    var py = FloatArray(0)
+    var pz = FloatArray(0)
+    var triBases = IntArray(0)
+    var triDepths = FloatArray(0)
+    var triOrder = IntArray(0)
+    var glPositions = FloatArray(0)
+    var glColors = IntArray(0)
+    val meshPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        style = android.graphics.Paint.Style.FILL
+    }
+    val jx = FloatArray(70)
+    val jy = FloatArray(70)
+
+    fun ensureVertexCapacity(n: Int) {
+        if (px.size < n) {
+            px = FloatArray(n)
+            py = FloatArray(n)
+            pz = FloatArray(n)
+        }
+    }
+
+    fun ensureTriCapacity(cap: Int) {
+        if (triBases.size < cap) {
+            triBases = IntArray(cap)
+            triDepths = FloatArray(cap)
+            triOrder = IntArray(cap)
+            glPositions = FloatArray(cap * 6)
+            glColors = IntArray(cap * 3)
+        }
+    }
+}
+
+private fun quickSortTrisDescending(order: IntArray, depths: FloatArray, low: Int, high: Int) {
+    if (low >= high) return
+    val pivot = depths[order[(low + high) ushr 1]]
+    var i = low
+    var j = high
+    while (i <= j) {
+        while (depths[order[i]] > pivot) i++
+        while (depths[order[j]] < pivot) j--
+        if (i <= j) {
+            val tmp = order[i]
+            order[i] = order[j]
+            order[j] = tmp
+            i++
+            j--
+        }
+    }
+    if (low < j) quickSortTrisDescending(order, depths, low, j)
+    if (i < high) quickSortTrisDescending(order, depths, i, high)
+}
+
 /**
  * Pure Compose 3D Spatial Avatar Viewport:
- * - Guaranteed real-time rendering on every device/emulator without SurfaceView z-order issues
- * - Auto-follows the live athlete smoothly so moving in front of the camera never leaves the viewport
- * - Renders depth-sorted lit 3D body mesh + color-coded MHR70 skeleton + studio floor grid
+ * - Renders the full 3D body mesh in a single hardware-accelerated drawVertices GPU call
+ * - Zero boxed per-frame allocations during triangle depth-sorting
+ * - Auto-follows the live athlete smoothly + color-coded MHR70 skeleton
  */
 @Composable
 fun Mhr3DViewport(
@@ -100,7 +155,6 @@ fun Mhr3DViewport(
         }
     }
 
-    // Smoothly track the live person in real time on every frame update
     LaunchedEffect(frameResult) {
         val first = frameResult?.persons?.firstOrNull()
         if (first != null) {
@@ -134,7 +188,7 @@ fun Mhr3DViewport(
         null -> GoldBone
     }
 
-    val triPath = remember { Path() }
+    val scratch = remember { MeshRenderScratch() }
 
     Box(
         modifier = modifier
@@ -165,7 +219,6 @@ fun Mhr3DViewport(
             val cosY = cos(yaw)
             val sinY = sin(yaw)
 
-            // Orbital camera in Y-down coordinates (worldUp = (0, -1, 0))
             val eyeX = targetX + distance * cosP * sinY
             val eyeY = targetY + distance * sinP
             val eyeZ = targetZ - distance * cosP * cosY
@@ -176,14 +229,12 @@ fun Mhr3DViewport(
             val fLen = max(1e-5f, sqrt(fx * fx + fy * fy + fz * fz))
             fx /= fLen; fy /= fLen; fz /= fLen
 
-            // right = forward x worldUp(0, -1, 0) = (+fz, 0, -fx)
             var rx = fz
             val ry = 0f
             var rz = -fx
             val rLen = max(1e-5f, sqrt(rx * rx + rz * rz))
             rx /= rLen; rz /= rLen
 
-            // camUp = right x forward
             val ux = ry * fz - rz * fy
             val uy = rz * fx - rx * fz
             val uz = rx * fy - ry * fx
@@ -209,7 +260,6 @@ fun Mhr3DViewport(
                 return halfH - (cy / cz) * focalPx
             }
 
-            // Compute floor height just beneath detected person's lowest joint
             var floorY = targetY + 0.90f
             val firstPerson = frameResult?.persons?.firstOrNull()
             if (firstPerson != null) {
@@ -246,19 +296,27 @@ fun Mhr3DViewport(
 
             val result = frameResult ?: return@Canvas
             val faces = result.faces
+            val baseR = TerracottaMesh.red
+            val baseG = TerracottaMesh.green
+            val baseB = TerracottaMesh.blue
+            val alphaInt = (meshAlpha.coerceIn(0.08f, 0.96f) * 255f).toInt().coerceIn(0, 255)
 
-            // 2. Render each detected person (3D Mesh + 3D Skeleton)
+            // 2. Render each detected person (GPU Batched 3D Mesh + 3D Skeleton)
             for (person in result.persons) {
                 val verts = person.verticesCam
                 val numVerts = verts.size / 3
 
                 if (showMesh && faces.size >= 3 && numVerts > 0) {
-                    val px = FloatArray(numVerts)
-                    val py = FloatArray(numVerts)
-                    val pz = FloatArray(numVerts)
+                    scratch.ensureVertexCapacity(numVerts)
+                    val px = scratch.px
+                    val py = scratch.py
+                    val pz = scratch.pz
+
                     for (v in 0 until numVerts) {
-                        val vx = verts[v * 3]; val vy = verts[v * 3 + 1]; val vz = verts[v * 3 + 2]
-                        val dx = vx - eyeX; val dy = vy - eyeY; val dz = vz - eyeZ
+                        val v3 = v * 3
+                        val dx = verts[v3] - eyeX
+                        val dy = verts[v3 + 1] - eyeY
+                        val dz = verts[v3 + 2] - eyeZ
                         val cz = dx * fx + dy * fy + dz * fz
                         pz[v] = cz
                         if (cz > 0.1f) {
@@ -274,78 +332,108 @@ fun Mhr3DViewport(
 
                     val totalTris = faces.size / 3
                     val step = when {
-                        totalTris > 12000 -> 6
-                        totalTris > 4000 -> 3
+                        totalTris > 12000 -> 4
+                        totalTris > 4000 -> 2
                         else -> 1
                     }
                     val cap = totalTris / step + 1
-                    val triBases = IntArray(cap)
-                    val triDepths = FloatArray(cap)
+                    scratch.ensureTriCapacity(cap)
+                    val triBases = scratch.triBases
+                    val triDepths = scratch.triDepths
+                    val triOrder = scratch.triOrder
                     var validCount = 0
 
                     var t = 0
                     while (t < totalTris) {
                         val base = t * 3
-                        val i0 = faces[base]; val i1 = faces[base + 1]; val i2 = faces[base + 2]
+                        val i0 = faces[base]
+                        val i1 = faces[base + 1]
+                        val i2 = faces[base + 2]
                         t += step
                         if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= numVerts || i1 >= numVerts || i2 >= numVerts) continue
                         if (!px[i0].isFinite() || !px[i1].isFinite() || !px[i2].isFinite()) continue
-                        val d = (pz[i0] + pz[i1] + pz[i2]) * 0.3333f
+                        val d = (pz[i0] + pz[i1] + pz[i2]) * 0.33333334f
                         if (d <= 0.15f) continue
                         triBases[validCount] = base
                         triDepths[validCount] = d
+                        triOrder[validCount] = validCount
                         validCount++
                     }
 
-                    // Primitive order array sorted back-to-front (painter's algorithm)
-                    val order = Array(validCount) { it }
-                    order.sortWith { a, b -> triDepths[b].compareTo(triDepths[a]) }
+                    if (validCount > 0) {
+                        quickSortTrisDescending(triOrder, triDepths, 0, validCount - 1)
 
-                    val baseR = TerracottaMesh.red
-                    val baseG = TerracottaMesh.green
-                    val baseB = TerracottaMesh.blue
-                    val alphaClamped = meshAlpha.coerceIn(0.08f, 0.96f)
+                        val glPos = scratch.glPositions
+                        val glCol = scratch.glColors
+                        var posIdx = 0
+                        var colIdx = 0
 
-                    for (idx in order) {
-                        val base = triBases[idx]
-                        val i0 = faces[base]; val i1 = faces[base + 1]; val i2 = faces[base + 2]
-                        val ax = verts[i1 * 3] - verts[i0 * 3]
-                        val ay = verts[i1 * 3 + 1] - verts[i0 * 3 + 1]
-                        val az = verts[i1 * 3 + 2] - verts[i0 * 3 + 2]
-                        val bx = verts[i2 * 3] - verts[i0 * 3]
-                        val by = verts[i2 * 3 + 1] - verts[i0 * 3 + 1]
-                        val bz = verts[i2 * 3 + 2] - verts[i0 * 3 + 2]
-                        val nx = ay * bz - az * by
-                        val ny = az * bx - ax * bz
-                        val nz = ax * by - ay * bx
-                        val nLen = max(1e-6f, sqrt(nx * nx + ny * ny + nz * nz))
-                        val ndotl = abs((nx * 0.4f - ny * 0.65f - nz * 0.64f) / nLen)
-                        val shade = (0.36f + 0.64f * ndotl).coerceIn(0.25f, 1.0f)
+                        for (k in 0 until validCount) {
+                            val idx = triOrder[k]
+                            val base = triBases[idx]
+                            val i0 = faces[base]
+                            val i1 = faces[base + 1]
+                            val i2 = faces[base + 2]
 
-                        triPath.reset()
-                        triPath.moveTo(px[i0], py[i0])
-                        triPath.lineTo(px[i1], py[i1])
-                        triPath.lineTo(px[i2], py[i2])
-                        triPath.close()
+                            val v0 = i0 * 3; val v1 = i1 * 3; val v2 = i2 * 3
+                            val ax = verts[v1] - verts[v0]
+                            val ay = verts[v1 + 1] - verts[v0 + 1]
+                            val az = verts[v1 + 2] - verts[v0 + 2]
+                            val bx = verts[v2] - verts[v0]
+                            val by = verts[v2 + 1] - verts[v0 + 1]
+                            val bz = verts[v2 + 2] - verts[v0 + 2]
 
-                        drawPath(
-                            path = triPath,
-                            color = Color(
-                                red = (baseR * shade).coerceIn(0f, 1f),
-                                green = (baseG * shade).coerceIn(0f, 1f),
-                                blue = (baseB * shade).coerceIn(0f, 1f),
-                                alpha = alphaClamped
+                            val nx = ay * bz - az * by
+                            val ny = az * bx - ax * bz
+                            val nz = ax * by - ay * bx
+                            val nLen = max(1e-6f, sqrt(nx * nx + ny * ny + nz * nz))
+                            val ndotl = abs((nx * 0.4f - ny * 0.65f - nz * 0.64f) / nLen)
+                            val shade = (0.36f + 0.64f * ndotl).coerceIn(0.25f, 1.0f)
+
+                            val r = ((baseR * shade) * 255f).toInt().coerceIn(0, 255)
+                            val g = ((baseG * shade) * 255f).toInt().coerceIn(0, 255)
+                            val b = ((baseB * shade) * 255f).toInt().coerceIn(0, 255)
+                            val argb = (alphaInt shl 24) or (r shl 16) or (g shl 8) or b
+
+                            glPos[posIdx++] = px[i0]
+                            glPos[posIdx++] = py[i0]
+                            glPos[posIdx++] = px[i1]
+                            glPos[posIdx++] = py[i1]
+                            glPos[posIdx++] = px[i2]
+                            glPos[posIdx++] = py[i2]
+
+                            glCol[colIdx++] = argb
+                            glCol[colIdx++] = argb
+                            glCol[colIdx++] = argb
+                        }
+
+                        val vertexCount = validCount * 3
+                        drawIntoCanvas { canvas ->
+                            canvas.nativeCanvas.drawVertices(
+                                android.graphics.Canvas.VertexMode.TRIANGLES,
+                                vertexCount * 2,
+                                glPos,
+                                0,
+                                null,
+                                0,
+                                glCol,
+                                0,
+                                null,
+                                0,
+                                0,
+                                scratch.meshPaint
                             )
-                        )
+                        }
                     }
                 }
 
                 // 3. 3D MHR70 Skeleton Overlay
                 val j3 = person.joints3dCam
-                val jx = FloatArray(70)
-                val jy = FloatArray(70)
+                val jx = scratch.jx
+                val jy = scratch.jy
                 for (j in 0 until 70) {
-                    val wx = j3[j * 3]; val wy = j3[j * 3 + 1]; val wz = j3[j * 3 + 2]
+                    val j3i = j * 3
+                    val wx = j3[j3i]; val wy = j3[j3i + 1]; val wz = j3[j3i + 2]
                     jx[j] = projectX(wx, wy, wz)
                     jy[j] = projectY(wx, wy, wz)
                 }

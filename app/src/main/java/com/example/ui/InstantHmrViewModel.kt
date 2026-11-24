@@ -86,6 +86,8 @@ data class StudioUiState(
     val timingHistory: List<TimingSample> = emptyList(),
     val isProcessing: Boolean = false,
     val statusBanner: String? = null,
+    val activeProviderLabel: String? = null,
+    val providerFallbackReason: String? = null,
     val activeSampleIndex: Int = 0,
     val useFrontCamera: Boolean = false,
     val videoState: VideoPlaybackState = VideoPlaybackState(),
@@ -784,6 +786,8 @@ class InstantHmrViewModel(application: Application) : AndroidViewModel(applicati
                                 snapshotCount = snapshotRecorder.count,
                                 totalSessionReps = newTotal,
                                 currentSetNumber = (newTotal / 12) + 1,
+                                activeProviderLabel = pipeline.lastActiveProviderLabel ?: res.engineLabel,
+                                providerFallbackReason = pipeline.lastFallbackReason,
                                 isProcessing = false,
                                 videoState = cur.videoState.copy(positionMs = posMs, durationMs = durMs)
                             )
@@ -857,6 +861,8 @@ class InstantHmrViewModel(application: Application) : AndroidViewModel(applicati
                         snapshotCount = snapshotRecorder.count,
                         totalSessionReps = newTotal,
                         currentSetNumber = (newTotal / 12) + 1,
+                        activeProviderLabel = pipeline.lastActiveProviderLabel ?: res.engineLabel,
+                        providerFallbackReason = pipeline.lastFallbackReason,
                         isProcessing = false
                     )
                 }
@@ -971,6 +977,8 @@ class InstantHmrViewModel(application: Application) : AndroidViewModel(applicati
                 timingHistory = nextHist,
                 exerciseFeedback = feedback,
                 snapshotCount = snapshotRecorder.count,
+                activeProviderLabel = pipeline.lastActiveProviderLabel ?: res.engineLabel,
+                providerFallbackReason = pipeline.lastFallbackReason,
                 isProcessing = false
             )
         }

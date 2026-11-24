@@ -1158,6 +1158,24 @@ private fun TwoDSourcePane(
                             modifier = Modifier.padding(10.dp).size(20.dp)
                         )
                     }
+                    val fr = uiState.frameResult
+                    if (fr != null && fr.persons.isNotEmpty() && !fr.isFullBodyVisible) {
+                        Surface(
+                            color = ObsidianBg.copy(alpha = 0.82f),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(8.dp)
+                                .border(1.dp, GoldBone.copy(alpha = 0.6f), RoundedCornerShape(14.dp))
+                        ) {
+                            Text(
+                                text = "Afaste-se para exibir o corpo inteiro",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = GoldBone,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                            )
+                        }
+                    }
                 } else {
                     Column(
                         modifier = Modifier

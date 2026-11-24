@@ -560,7 +560,9 @@ private fun FitVersoNavHost(
                 onCancelDownload = viewModel::cancelDownload,
                 onImportCustomOnnx = viewModel::importCustomOnnx,
                 onDeleteCachedFile = viewModel::deleteCachedModel,
-                onUpdateConfig = viewModel::updateConfig
+                onUpdateConfig = viewModel::updateConfig,
+                activeProviderLabel = uiState.activeProviderLabel ?: uiState.frameResult?.engineLabel,
+                providerFallbackReason = uiState.providerFallbackReason
             )
         }
     }

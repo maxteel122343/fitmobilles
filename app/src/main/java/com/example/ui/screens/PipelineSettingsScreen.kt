@@ -49,6 +49,8 @@ import kotlin.math.roundToInt
 fun PipelineSettingsScreen(
     config: PipelineConfig,
     onUpdateConfig: ((PipelineConfig) -> PipelineConfig) -> Unit,
+    activeProviderLabel: String? = null,
+    providerFallbackReason: String? = null,
     modifier: Modifier = Modifier
 ) {
     var focalText by remember(config.customFocalPx) {
@@ -116,6 +118,18 @@ fun PipelineSettingsScreen(
                             )
                         )
                     }
+                }
+                Text(
+                    text = "Provedor ativo: ${activeProviderLabel ?: "Aguardando inferência (${config.executionDevice.label})"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (providerFallbackReason != null) GoldBone else CyanBox
+                )
+                if (!providerFallbackReason.isNullOrBlank()) {
+                    Text(
+                        text = "Fallback automático: $providerFallbackReason",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GoldBone
+                    )
                 }
 
                 OutlinedTextField(
